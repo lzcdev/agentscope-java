@@ -36,7 +36,6 @@ import io.agentscope.harness.agent.workspace.WorkspaceIndex;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
-import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -67,9 +66,10 @@ public class RemoteFilesystem implements AbstractFilesystem {
     private final NamespaceFactory namespaceFactory;
 
     /**
-     * Optional best-effort local index. When non-null, {@code ls}, {@code glob}, {@code exists}
-     * and {@code grep} consult the index first and fall back to the remote store only when the
-     * index has no matching entries.
+     * Optional best-effort local index. Enumeration operations ({@code ls}, {@code glob},
+     * {@code grep}) always read the authoritative remote store; the index may be node-local and
+     * stale, so it must never conceal store entries. {@code exists} still consults it as a
+     * short-circuit.
      */
     private WorkspaceIndex index;
 
@@ -111,23 +111,15 @@ public class RemoteFilesystem implements AbstractFilesystem {
     }
 
     /**
-     * Attaches a best-effort {@link WorkspaceIndex} to accelerate list/glob/exists/grep
-     * operations. The index may be {@code null} (disabled) or become stale.
+     * Attaches a best-effort {@link WorkspaceIndex}. The index may be {@code null} (disabled)
+     * or become stale.
      *
-     * <p>Fallback semantics differ per operation:
+     * <p>Only {@code exists} consults it as a short-circuit. Enumeration operations
+     * ({@code ls}, {@code glob}, {@code grep}) always read the authoritative remote store:
+     * the index is node-local and best-effort, so a fast path can never be trusted to enumerate
+     * all store entries even when it returns a non-empty result (#3197).
      *
-     * <ul>
-     *   <li>{@code ls}, {@code glob}, {@code exists} — when the index has no matching prefix
-     *       the operation falls back to a full remote-store scan, so results remain correct
-     *       even if this node's index is stale.
-     *   <li>{@code grep} — when the index is non-{@code null} the operation first enumerates
-     *       candidates from the index. If the index path yields zero matches, the operation
-     *       falls back to a full remote-store scan so that sibling-node writes not yet seen by
-     *       this node's index are not silently missed. Content for each candidate is always
-     *       fetched authoritatively from the remote store.
-     * </ul>
-     *
-     * @param index workspace index; {@code null} disables index-backed fast paths
+     * @param index workspace index; {@code null} disables the {@code exists} fast path
      * @return this instance (fluent)
      */
     public RemoteFilesystem withIndex(WorkspaceIndex index) {
@@ -241,33 +233,9 @@ public class RemoteFilesystem implements AbstractFilesystem {
     public LsResult ls(RuntimeContext runtimeContext, String path) {
         String normalizedPath = path.endsWith("/") ? path : path + "/";
 
-        // Fast path: index has entries for this prefix
-        if (index != null && index.hasPrefix(normalizedPath)) {
-            List<String> indexPaths = index.listByPrefix(normalizedPath);
-            List<FileInfo> infos = new ArrayList<>();
-            Set<String> subdirs = new LinkedHashSet<>();
-            for (String p : indexPaths) {
-                String relative = p.substring(normalizedPath.length());
-                if (relative.contains("/")) {
-                    String subdirName = relative.substring(0, relative.indexOf('/'));
-                    subdirs.add(normalizedPath + subdirName + "/");
-                } else {
-                    infos.add(FileInfo.ofFile(p, 0, ""));
-                }
-            }
-            for (String subdir : subdirs) {
-                infos.add(FileInfo.ofDir(subdir, ""));
-            }
-            // The index is best-effort and node-local. An empty fast-path result is not
-            // authoritative: sibling nodes may have written files this index has not seen
-            // (#3197). Fall through to the store scan, mirroring grep().
-            if (!infos.isEmpty()) {
-                infos.sort(Comparator.comparing(FileInfo::path));
-                return LsResult.success(infos);
-            }
-        }
-
-        // Fallback: full remote scan
+        // The store is authoritative for enumeration. The optional index is node-local and
+        // best-effort and is deliberately not used here: even a non-empty index result can
+        // omit files written by a sibling node (#3197).
         List<StoreItem> items = searchAllItems(runtimeContext);
         List<FileInfo> infos = new ArrayList<>();
         Set<String> subdirs = new LinkedHashSet<>();
@@ -428,51 +396,10 @@ public class RemoteFilesystem implements AbstractFilesystem {
             globMatcher = FileSystems.getDefault().getPathMatcher("glob:" + glob);
         }
 
-        // Fast path: use the index to enumerate candidate paths under {@code normalizedPath},
-        // then fetch each file's content from the remote store and scan it line-by-line. The
-        // index only narrows the candidate set; content is always read authoritatively from
-        // the store (never from local disk), so stale/missing local copies cannot mask matches.
-        if (index != null) {
-            List<String> candidates =
-                    "/".equals(normalizedPath)
-                            ? index.listByPrefix("")
-                            : index.listByPrefix(normalizedPath);
-            List<GrepMatch> matches = new ArrayList<>();
-            for (String key : candidates) {
-                if (!matchesPathPrefix(key, normalizedPath)) {
-                    continue;
-                }
-                if (globMatcher != null) {
-                    String fileName =
-                            key.contains("/") ? key.substring(key.lastIndexOf('/') + 1) : key;
-                    if (!globMatcher.matches(java.nio.file.Path.of(fileName))) {
-                        continue;
-                    }
-                }
-                StoreItem item = store.get(getNamespace(runtimeContext), key);
-                if (item == null) {
-                    continue;
-                }
-                FileData fd = convertItemToFileData(item);
-                if (fd == null || fd.content() == null) {
-                    continue;
-                }
-                String[] lines = fd.content().split("\n", -1);
-                for (int i = 0; i < lines.length; i++) {
-                    if (lines[i].contains(pattern)) {
-                        matches.add(new GrepMatch(key, i + 1, lines[i]));
-                    }
-                }
-            }
-            // Index returned matches — return them. Otherwise fall through to the authoritative
-            // store scan: on a multi-node deployment, this node's index may not yet know about
-            // files written via another node, and we must not silently miss them.
-            if (!matches.isEmpty()) {
-                return GrepResult.success(matches);
-            }
-        }
-
-        // Fallback: full remote scan
+        // The store is authoritative for enumeration. The optional index is node-local and
+        // best-effort and is deliberately not used here: even a non-empty candidate list can
+        // omit files written by a sibling node, and the comment above the old fast path
+        // claimed this must not silently miss remote writes (#3197).
         List<StoreItem> items = searchAllItems(runtimeContext);
         List<GrepMatch> matches = new ArrayList<>();
         for (StoreItem item : items) {
@@ -531,35 +458,9 @@ public class RemoteFilesystem implements AbstractFilesystem {
         PathMatcher directMatcher =
                 FileSystems.getDefault().getPathMatcher("glob:" + directPattern);
 
-        // Fast path: index has entries for this prefix
-        if (index != null && index.hasPrefix(normalizedPath)) {
-            List<String> candidates = index.listByPrefix(normalizedPath);
-            List<FileInfo> results = new ArrayList<>();
-            for (String key : candidates) {
-                if (!matchesPathPrefix(key, normalizedPath)) {
-                    continue;
-                }
-                String relativePath;
-                if ("/".equals(normalizedPath)) {
-                    relativePath = key.startsWith("/") ? key.substring(1) : key;
-                } else {
-                    relativePath = key.substring(normalizedPath.length() + 1);
-                }
-                if (matcher.matches(Path.of(relativePath))
-                        || directMatcher.matches(Path.of(relativePath))) {
-                    results.add(FileInfo.ofFile(key, 0, ""));
-                }
-            }
-            // The index is best-effort and node-local. After pattern filtering the fast path
-            // may yield nothing even when the store has matches (#3197); only return when it
-            // produced results, otherwise fall through to the authoritative store scan.
-            if (!results.isEmpty()) {
-                results.sort(Comparator.comparing(FileInfo::path));
-                return GlobResult.success(results);
-            }
-        }
-
-        // Fallback: full remote scan
+        // The store is authoritative for enumeration. The optional index is node-local and
+        // best-effort and is deliberately not used here: even a non-empty index result can
+        // omit files written by a sibling node (#3197).
         List<StoreItem> items = searchAllItems(runtimeContext);
         List<FileInfo> results = new ArrayList<>();
         for (StoreItem item : items) {

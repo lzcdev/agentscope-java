@@ -22,6 +22,7 @@ import static org.mockito.Mockito.when;
 
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.harness.agent.filesystem.model.GlobResult;
+import io.agentscope.harness.agent.filesystem.model.GrepResult;
 import io.agentscope.harness.agent.filesystem.model.LsResult;
 import io.agentscope.harness.agent.filesystem.remote.RemoteFilesystem;
 import io.agentscope.harness.agent.filesystem.remote.store.InMemoryStore;
@@ -30,60 +31,63 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * Regression tests for issue #3197: {@link RemoteFilesystem#ls} and {@link RemoteFilesystem#glob}
- * must not treat an empty result from the local index fast path as authoritative. The index is
- * best-effort and node-local; when its filtered result is empty, the operation must fall through
- * to the authoritative remote-store scan, mirroring {@code grep()}.
+ * Regression tests for issue #3197: the remote store is authoritative for enumeration.
+ *
+ * <p>The optional {@link WorkspaceIndex} is node-local and best-effort. Even when it holds a
+ * non-empty but partial view of a prefix, {@code ls}, {@code glob} and {@code grep} must return
+ * every matching file in the store — a sibling node may have written a file this index has not
+ * seen. An empty-result-only scenario would pass even with a fast path that returns early, so
+ * these tests deliberately use a partial index to pin the store-authoritative behavior.
  */
 class RemoteFilesystemIndexFallbackTest {
 
     private static final RuntimeContext CTX = RuntimeContext.empty();
 
-    @Test
-    void ls_fallsBackToStore_whenIndexFastPathYieldsNoEntries() {
+    /**
+     * Index holds only {@code a.md}; the store holds both {@code a.md} and {@code b.md}.
+     * A fast path that trusts the index would miss {@code b.md}.
+     */
+    private RemoteFilesystem fsWithPartialIndex() {
         InMemoryStore store = new InMemoryStore();
         RemoteFilesystem fs = new RemoteFilesystem(store, List.of("shared"));
-        assertTrue(fs.write(CTX, "/memory/notes.md", "hello").isSuccess());
+        assertTrue(fs.write(CTX, "/memory/a.md", "needle in a").isSuccess());
+        assertTrue(fs.write(CTX, "/memory/b.md", "needle in b").isSuccess());
 
-        // Index claims the prefix is known but returns no entries — the stale-index shape
-        // described in #3197 (also reachable via a concurrent index change).
         WorkspaceIndex index = mock(WorkspaceIndex.class);
         when(index.hasPrefix("/memory/")).thenReturn(true);
-        when(index.listByPrefix("/memory/")).thenReturn(List.of());
+        when(index.hasPrefix("/memory")).thenReturn(true);
+        when(index.listByPrefix("/memory/")).thenReturn(List.of("/memory/a.md"));
+        when(index.listByPrefix("/memory")).thenReturn(List.of("/memory/a.md"));
         fs.withIndex(index);
-
-        LsResult result = fs.ls(CTX, "/memory");
-        assertTrue(result.isSuccess());
-        assertEquals(
-                1,
-                result.entries().size(),
-                () ->
-                        "ls must fall back to the store when the index fast path is empty: "
-                                + result);
-        assertEquals("/memory/notes.md", result.entries().get(0).path());
+        return fs;
     }
 
     @Test
-    void glob_fallsBackToStore_whenIndexFastPathYieldsNoMatches() {
-        InMemoryStore store = new InMemoryStore();
-        RemoteFilesystem fs = new RemoteFilesystem(store, List.of("shared"));
-        assertTrue(fs.write(CTX, "/memory/facts.md", "facts").isSuccess());
+    void ls_returnsStoreFiles_whenIndexIsPartial() {
+        LsResult result = fsWithPartialIndex().ls(CTX, "/memory");
+        assertTrue(result.isSuccess());
+        assertEquals(2, result.entries().size(), () -> "ls must list both store files: " + result);
+        assertEquals("/memory/a.md", result.entries().get(0).path());
+        assertEquals("/memory/b.md", result.entries().get(1).path());
+    }
 
-        // Index claims the prefix is known but its candidates are filtered out by the glob,
-        // so the fast path produces zero results while the store still has a matching file.
-        WorkspaceIndex index = mock(WorkspaceIndex.class);
-        when(index.hasPrefix("/memory")).thenReturn(true);
-        when(index.listByPrefix("/memory")).thenReturn(List.of("/memory/other.txt"));
-        fs.withIndex(index);
-
-        GlobResult result = fs.glob(CTX, "*.md", "/memory");
+    @Test
+    void glob_returnsStoreFiles_whenIndexIsPartial() {
+        GlobResult result = fsWithPartialIndex().glob(CTX, "*.md", "/memory");
         assertTrue(result.isSuccess());
         assertEquals(
-                1,
-                result.matches().size(),
-                () ->
-                        "glob must fall back to the store when the index fast path is empty: "
-                                + result);
-        assertEquals("/memory/facts.md", result.matches().get(0).path());
+                2, result.matches().size(), () -> "glob must match both store files: " + result);
+        assertEquals("/memory/a.md", result.matches().get(0).path());
+        assertEquals("/memory/b.md", result.matches().get(1).path());
+    }
+
+    @Test
+    void grep_returnsStoreFiles_whenIndexIsPartial() {
+        GrepResult result = fsWithPartialIndex().grep(CTX, "needle", "/memory", "*.md");
+        assertTrue(result.isSuccess());
+        assertEquals(
+                2, result.matches().size(), () -> "grep must match both store files: " + result);
+        assertEquals("/memory/a.md", result.matches().get(0).path());
+        assertEquals("/memory/b.md", result.matches().get(1).path());
     }
 }
